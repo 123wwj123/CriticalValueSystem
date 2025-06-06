@@ -80,7 +80,7 @@ namespace ZL_BJCAAllinterface
                     ClsPublic.WriteLog("CA证书信息查询成功，拼接需要的信息", 3);
                     //签章信息： 主键|姓名|部门|证件类型|证件号码|手机|固定电话|邮件|工号|人脸ID|签章ID|用户ID|状态|创建时间
                     EncCert = objJson["data"]["id"].Value<string>() + "|" + objJson["data"]["username"].Value<string>() + "|" + objJson["data"]["department"].Value<string>() + "|" +
-                                objJson["data"]["idType"].Value<string>() + "|" + objJson["data"]["idCard"].Value<string>() + "|" + objJson["data"]["mobilePhone"].Value<string>() + " |" + "|" +
+                                objJson["data"]["idType"].Value<string>() + "|" + objJson["data"]["idCard"].Value<string>() + "|" + objJson["data"]["mobilePhone"].Value<string>() + "||" +
                                 objJson["data"]["email"].Value<string>() + "|" + objJson["data"]["jobNumber"].Value<string>() + "|" + objJson["data"]["faceId"].Value<string>() + "|" + objJson["data"]["signpicId"].Value<string>() + "|" +
                                 objJson["data"]["msspId"].Value<string>() + "|" + objJson["data"]["status"].Value<string>() + "|" + objJson["data"]["createTime"].Value<string>();
                     ClsPublic.WriteLog("拼接的CA证书签章信息：" + EncCert, 4);

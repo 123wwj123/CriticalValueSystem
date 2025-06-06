@@ -106,7 +106,6 @@ namespace ZL_BJCAAllinterface
             catch (Exception e)
             {
                 return "{\"statusCode\":\"-1\",\"\":\"" + e.Message + "\"}";
-                throw;
             }
             finally
             {
