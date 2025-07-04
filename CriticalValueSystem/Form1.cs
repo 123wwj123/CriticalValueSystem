@@ -24,6 +24,7 @@ using System.Diagnostics;
 //using CefSharp.WinForms;
 using Oracle.ManagedDataAccess.Client;
 using ZL_BJCAAllinterface;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.Header;
 namespace CriticalValueSystem
 {
     public partial class Form1 : Form
@@ -84,6 +85,9 @@ namespace CriticalValueSystem
                             // 注意：这个列表只在UI线程的UpdateCriticalValueList方法中更新，
                             // 在UI事件(MouseClick)中读取，因此通常不需要额外的锁，但访问时需要小心。
 
+        private System.Timers.Timer reminderTimer; // 新增：提醒定时器
+        //private readonly int reminderInterval; // 提醒间隔（毫秒）
+        private int reminderInterval; // 提醒间隔（毫秒），现在将从服务器获取
 
         // 从配置文件读取配置
         private readonly string SecretKey;
@@ -93,6 +97,7 @@ namespace CriticalValueSystem
         private readonly string WebAppUrl;
         private readonly string HomeUrl;
         private readonly string ClientType;
+        private readonly string NatureType;
         //private readonly string PublicKey;
         // 用户登录信息
         private UserLoginInfo currentUser;
@@ -125,6 +130,7 @@ namespace CriticalValueSystem
             WebAppUrl = ConfigurationManager.AppSettings["WebAppUrl"];
             HomeUrl = ConfigurationManager.AppSettings["HomeUrl"];
             ClientType= ConfigurationManager.AppSettings["ClientType"];
+            NatureType = ConfigurationManager.AppSettings["NatureType"];
             // 新增：验证RSA公钥配置
             try
             {
@@ -185,8 +191,17 @@ namespace CriticalValueSystem
 
 
 
+            //// 从配置文件读取提醒间隔，默认为10分钟（600000毫秒）
+            //reminderInterval = int.TryParse(ConfigurationManager.AppSettings["ReminderInterval"], out int interval)
+            //    ? interval : 600000;
+            //InitializeReminderTimer(); // 初始化提醒定时器
 
+            // **** 修改点: 不再从配置文件读取 ReminderInterval ****
+            // **** 为 reminderInterval 设置一个默认值，稍后会从服务器获取新值 ****
+            this.reminderInterval = 600000; // 默认10分钟
 
+            // **** 修改点: InitializeReminderTimer() 将在从服务器获取到配置后被调用 ****
+            // InitializeReminderTimer(); // 初始化提醒定时器
 
 
             // 设置 ListBox 的字体和样式
@@ -216,6 +231,57 @@ namespace CriticalValueSystem
             // 订阅窗体大小改变事件
             this.Resize += Form1_Resize;
         }
+
+
+        //private void InitializeReminderTimer()
+        //{
+        //    reminderTimer = new System.Timers.Timer(reminderInterval);
+        //    reminderTimer.Elapsed += ReminderTimer_Elapsed;
+        //    reminderTimer.AutoReset = true; // 自动重复
+        //    reminderTimer.Enabled = true; // 启动定时器
+        //    Console.WriteLine($"{DateTime.Now}: 提醒定时器已初始化，间隔 {reminderInterval / 1000} 秒。");
+        //}
+        // **** 修改点: 更新此方法以处理重新初始化 ****
+        private void InitializeReminderTimer()
+        {
+            // 如果定时器已存在，先停止并销毁它，以便使用新的间隔重新创建
+            if (reminderTimer != null)
+            {
+                reminderTimer.Stop();
+                reminderTimer.Dispose();
+            }
+
+            // 确保间隔是一个正数，以防服务器返回无效值
+            int interval = this.reminderInterval > 0 ? this.reminderInterval : 600000; // 如果间隔无效，回退到10分钟
+
+            reminderTimer = new System.Timers.Timer(interval);
+            reminderTimer.Elapsed += ReminderTimer_Elapsed;
+            reminderTimer.AutoReset = true; // 自动重复
+            reminderTimer.Enabled = true; // 启动定时器
+            Console.WriteLine($"{DateTime.Now}: 提醒定时器已初始化或更新，间隔 {interval / 1000} 秒。");
+        }
+        private void ReminderTimer_Elapsed(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            // 只对医生（Nature=1）执行提醒
+            if (NatureType != "1") return;
+
+            int unprocessedCount;
+            lock (criticalValuesLock)
+            {
+                unprocessedCount = criticalValues.Count(v => !v.IsProcessed);
+            }
+
+            if (unprocessedCount > 0 && (WindowState == FormWindowState.Minimized || !Visible))
+            {
+                Console.WriteLine($"{DateTime.Now}: 检测到 {unprocessedCount} 条未处理危急值，触发弹框提醒。");
+                ShowAndFocusForm(); // 弹框提醒
+                ShowNotification($"有 {unprocessedCount} 条未处理危急值，请及时处理！"); // 托盘通知
+            }
+        }
+
+
+
+
         // 创建自定义标题栏
         //使用TableLayoutPanel精确控制布局
         private void CreateCustomTitleBar()
@@ -367,6 +433,79 @@ namespace CriticalValueSystem
         }
 
 
+        // **** 新增点: 从服务器获取提醒间隔的方法 ****
+        private async Task FetchReminderIntervalSettingAsync()
+        {
+            // 确保用户已登录且Token有效
+            if (!isUserLoggedIn || string.IsNullOrEmpty(accessToken))
+            {
+                Console.WriteLine($"{DateTime.Now}: 获取提醒间隔设置失败 - 未登录或Token无效。");
+                // 如果在登录前获取失败，使用默认值初始化定时器
+                InitializeReminderTimer();
+                return;
+            }
+
+            string configKey = "critical.client.timeouter"; // 配置项的Key
+            string apiUrl = $"{ApiBaseUrl}/system/config/configKey/{configKey}";
+
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, apiUrl))
+                {
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+                    Console.WriteLine($"{DateTime.Now}: 正在获取提醒间隔设置 ({configKey})...");
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        var configResponse = JsonConvert.DeserializeObject<ConfigResponse>(responseBody);
+
+                        if (configResponse != null && configResponse.Code == 200 && int.TryParse(configResponse.Message, out int newInterval) && newInterval > 0)
+                        {
+                            // 成功解析到有效的间隔时间
+                            if (this.reminderInterval != newInterval)
+                            {
+                                this.reminderInterval = newInterval;
+                                Console.WriteLine($"{DateTime.Now}: 服务器提醒间隔设置更新为: {newInterval} 毫秒。");
+                                // 使用新的间隔重新初始化定时器
+                                InitializeReminderTimer();
+                            }
+                            else
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 服务器提醒间隔设置未改变 ({newInterval} 毫秒).");
+                                // 如果定时器未运行，则初始化
+                                if (reminderTimer == null || !reminderTimer.Enabled)
+                                {
+                                    InitializeReminderTimer();
+                                }
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 获取提醒间隔设置失败 - API响应无效或解析失败。 Code: {configResponse?.Code}, Msg: {configResponse?.Message}。将使用默认间隔。");
+                            // 如果API响应无效，使用默认值初始化定时器
+                            InitializeReminderTimer();
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 获取提醒间隔设置失败 - HTTP状态码: {response.StatusCode}。将使用默认间隔。");
+                        // 如果HTTP请求失败，使用默认值初始化定时器
+                        InitializeReminderTimer();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{DateTime.Now}: 获取提醒间隔设置时发生异常: {ex.Message}。将使用默认间隔。");
+                // 如果发生异常，使用默认值初始化定时器
+                InitializeReminderTimer();
+            }
+        }
+
+
         // 新增方法：从服务器获取按钮可见性配置
         private async Task FetchButtonVisibilitySettingAsync()
         {
@@ -448,6 +587,8 @@ namespace CriticalValueSystem
         }
 
 
+
+
         // 重命名并修改 UpdateButtonsVisibility 方法
         /// <summary>
         /// 应用按钮可见性设置，优先考虑列表是否为空。
@@ -480,7 +621,7 @@ namespace CriticalValueSystem
             else
             {
                 //医生默认不给关,但是可以控制
-                if (currentUser.Nature.Equals("1"))
+                if (NatureType.Equals("1")|| NatureType.Equals("2"))
                 {
 
                     // 列表不为空时，读取并应用服务器的设置
@@ -491,13 +632,13 @@ namespace CriticalValueSystem
                     Console.WriteLine($"按钮可见性应用: 列表有数据，根据服务器设置决定显示={shouldShowButtons} (服务器允许={serverAllowsButtonVisibility})");
 
                 }
-                else 
-                {
+                else
+                {    //除了医生其他都可以关
                     shouldShowButtons = true;
 
                 }
 
-                //护士给关
+            
 
             }
 
@@ -526,6 +667,10 @@ namespace CriticalValueSystem
                     Console.WriteLine("警告: 关闭按钮已被释放，无法设置可见性。");
                 }
             }
+
+            // 更新 ListBox 以触发重新绘制（确保按钮显示正确）
+            lstCriticalValues.Invalidate();
+
         }
 
         // 新增方法：从服务器获取超时是否需要补救措施的配置
@@ -723,6 +868,9 @@ namespace CriticalValueSystem
         //public void UpdateFormTitle(string userName = null, int? criticalValueCount = null)
         public void UpdateFormTitle(string userName = null, int? pendingConfirmationCount = null, int? pendingProcessingCount = null)
         {
+
+            string nature = NatureType ?? "1";
+
             if (titleLabel == null || titleLabel.IsDisposed)
             {
                 return; // 标题标签无效
@@ -776,14 +924,27 @@ namespace CriticalValueSystem
                 if (!string.IsNullOrEmpty(currentUserName))
                 {
                     titleBuilder.Append($" - 登录人：{currentUserName}");
-                    // 添加未处理（待确认）数量
-                    titleBuilder.Append($" 当前待确认 {currentConfirmationCount}条");
-
-                    // 如果待处理数量大于0，则添加待处理信息
-                    if (currentProcessingCount > 0)
+                    if (nature == "1")
                     {
-                        titleBuilder.Append($", 当前待处理 {currentProcessingCount}条请及时进入首页处理");
+                        // 添加未处理（待确认）数量
+                        titleBuilder.Append($" 当前待处理 {currentConfirmationCount}条请及时进入处理");
+
+                        // 如果待处理数量大于0，则添加待处理信息
+                        //if (currentProcessingCount > 0)
+                        //{
+                        //    titleBuilder.Append($", 当前待处理 {currentProcessingCount}条请及时进入首页处理");
+                        //}
                     }
+                    else if (nature == "2") {
+                        titleBuilder.Append($" 当前待确认 {currentConfirmationCount}条请及时确认并通知医生");
+                    }
+                    else if (nature == "3")
+                    {
+                        // 添加未处理（待确认）数量
+                        // titleBuilder.Append($" 当前待查阅 {GetUnprocessedCriticalValueCount()}条");
+                        titleBuilder.Append($" 当前待查阅 {currentConfirmationCount}条");
+                    }
+
 
                 }
 
@@ -850,12 +1011,21 @@ namespace CriticalValueSystem
         // 1. 修改方法签名为 async void
         private async void HomeButton_ClickAsync(object sender, EventArgs e)
         {
+
+            string nature = NatureType ?? "1";
             // 2. 添加 try-catch 块来捕获所有可能的异常
             Button clickedButton = sender as Button; // 获取被点击的按钮
             if (clickedButton != null)
             {
                 clickedButton.Enabled = false; // 防止重复点击
             }
+
+            bool checkCA = false;
+            lock (enabledCALock) // 读取服务器设置医技科室是否CA
+            {
+                checkCA = enabledCa;
+            }
+
 
             try
             {
@@ -866,40 +1036,112 @@ namespace CriticalValueSystem
                 //    return; //提前返回前，确保按钮状态已处理 (见 finally)
                 //}
 
-                // 假设 APP_CheckCertificate 是一个同步方法，如果它可能抛出异常，也应考虑在内
-                if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo))
+                if (nature == "1")//医生需要CA登录首页
                 {
-                    // CA签名后获取Token
-                    await TimeoutGetAccessTokenAsync(strInfo); // 这是一个异步调用
-
-                    // TimeoutaccessToken 应该是您类中的一个字段或属性，由 TimeoutGetAccessTokenAsync 填充
-                    if (string.IsNullOrEmpty(this.TimeoutaccessToken)) // 假设 TimeoutaccessToken 是类成员
+                    // 假设 APP_CheckCertificate 是一个同步方法，如果它可能抛出异常，也应考虑在内
+                    if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo, out string strInfoName))
                     {
-                        MessageBox.Show("未能获取有效的访问令牌，请稍后重试或检查登录状态。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return; //提前返回前，确保按钮状态已处理 (见 finally)
+                        // CA签名后获取Token
+                        await TimeoutGetAccessTokenAsync(strInfo); // 这是一个异步调用
+
+                        // TimeoutaccessToken 应该是您类中的一个字段或属性，由 TimeoutGetAccessTokenAsync 填充
+                        if (string.IsNullOrEmpty(this.TimeoutaccessToken)) // 假设 TimeoutaccessToken 是类成员
+                        {
+                            MessageBox.Show("未能获取有效的访问令牌，请稍后重试或检查登录状态。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return; //提前返回前，确保按钮状态已处理 (见 finally)
+                        }
+
+                        if (string.IsNullOrEmpty(HomeUrl))
+                        {
+                            MessageBox.Show("首页地址未配置。", "配置错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return; //提前返回前，确保按钮状态已处理 (见 finally)
+                        }
+
+                        string url = $"{HomeUrl}{this.TimeoutaccessToken}"; // 使用 this.TimeoutaccessToken
+                        Console.WriteLine($"HomeButton: Opening URL: {url}"); // 调试日志
+
+                        // 使用 ProcessStartInfo 以更好地控制，并确保 UseShellExecute = true 以打开默认浏览器
+                        ProcessStartInfo psi = new ProcessStartInfo(url)
+                        {
+                            UseShellExecute = true // 这对于打开URL到默认浏览器很重要
+                        };
+                        System.Diagnostics.Process.Start(psi);
+                    }
+                    else
+                    {
+                        // APP_CheckCertificate 返回 false，可以根据 strInfo 显示更详细的错误
+                        MessageBox.Show($"证书验证失败或操作被取消。详情: {strInfo}", "验证失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     }
 
-                    if (string.IsNullOrEmpty(HomeUrl))
+                }
+                else if(nature == "3")//医技
+                {
+                    if (checkCA)
                     {
-                        MessageBox.Show("首页地址未配置。", "配置错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        return; //提前返回前，确保按钮状态已处理 (见 finally)
+                        // 假设 APP_CheckCertificate 是一个同步方法，如果它可能抛出异常，也应考虑在内
+                        if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo, out string strInfoName))
+                        {
+                            // CA签名后获取Token
+                            await TimeoutGetAccessTokenAsync(strInfo); // 这是一个异步调用
+
+                            // TimeoutaccessToken 应该是您类中的一个字段或属性，由 TimeoutGetAccessTokenAsync 填充
+                            if (string.IsNullOrEmpty(this.TimeoutaccessToken)) // 假设 TimeoutaccessToken 是类成员
+                            {
+                                MessageBox.Show("未能获取有效的访问令牌，请稍后重试或检查登录状态。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                                return; //提前返回前，确保按钮状态已处理 (见 finally)
+                            }
+
+                            if (string.IsNullOrEmpty(HomeUrl))
+                            {
+                                MessageBox.Show("首页地址未配置。", "配置错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return; //提前返回前，确保按钮状态已处理 (见 finally)
+                            }
+
+                            string url = $"{HomeUrl}{this.TimeoutaccessToken}"; // 使用 this.TimeoutaccessToken
+                            Console.WriteLine($"HomeButton: Opening URL: {url}"); // 调试日志
+
+                            // 使用 ProcessStartInfo 以更好地控制，并确保 UseShellExecute = true 以打开默认浏览器
+                            ProcessStartInfo psi = new ProcessStartInfo(url)
+                            {
+                                UseShellExecute = true // 这对于打开URL到默认浏览器很重要
+                            };
+                            System.Diagnostics.Process.Start(psi);
+                        }
+                        else
+                        {
+                            // APP_CheckCertificate 返回 false，可以根据 strInfo 显示更详细的错误
+                            MessageBox.Show($"证书验证失败或操作被取消。详情: {strInfo}", "验证失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                    }
+                    else  //医技没开启CA                 
+                    {
+                        string url = $"{HomeUrl}{this.accessToken}"; // 使用 this.TimeoutaccessToken
+                        Console.WriteLine($"HomeButton: Opening URL: {url}"); // 调试日志
+                        // 使用 ProcessStartInfo 以更好地控制，并确保 UseShellExecute = true 以打开默认浏览器
+                        ProcessStartInfo psi = new ProcessStartInfo(url)
+                        {
+                            UseShellExecute = true // 这对于打开URL到默认浏览器很重要
+                        };
+                        System.Diagnostics.Process.Start(psi);
                     }
 
-                    string url = $"{HomeUrl}{this.TimeoutaccessToken}"; // 使用 this.TimeoutaccessToken
+                }
+                else
+                {//护士不需要
+                    string url = $"{HomeUrl}{this.accessToken}"; // 使用 this.TimeoutaccessToken
                     Console.WriteLine($"HomeButton: Opening URL: {url}"); // 调试日志
-
-                    // 使用 ProcessStartInfo 以更好地控制，并确保 UseShellExecute = true 以打开默认浏览器
+                                                                          // 使用 ProcessStartInfo 以更好地控制，并确保 UseShellExecute = true 以打开默认浏览器
                     ProcessStartInfo psi = new ProcessStartInfo(url)
                     {
                         UseShellExecute = true // 这对于打开URL到默认浏览器很重要
                     };
                     System.Diagnostics.Process.Start(psi);
+
                 }
-                else
-                {
-                    // APP_CheckCertificate 返回 false，可以根据 strInfo 显示更详细的错误
-                    MessageBox.Show($"证书验证失败或操作被取消。详情: {strInfo}", "验证失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
+
+
+
+
             }
             catch (System.ComponentModel.Win32Exception winEx)
             {
@@ -1091,6 +1333,91 @@ namespace CriticalValueSystem
             this.TopMost = true;
         }
 
+        //private void LstCriticalValues_DrawItem(object sender, DrawItemEventArgs e)
+        //{
+        //    if (e.Index < 0 || e.Index >= lstCriticalValues.Items.Count)
+        //        return;
+
+        //    e.DrawBackground();
+        //    string itemText = lstCriticalValues.Items[e.Index].ToString();
+        //    Brush textBrush = new SolidBrush(e.ForeColor);
+
+        //    // 计算文本区域，为两个按钮留出空间
+        //    int buttonsWidth = 170; // 两个按钮的总宽度加间距
+        //    Rectangle textRect = new Rectangle(
+        //    e.Bounds.Left,
+        //    e.Bounds.Top,
+        //    e.Bounds.Width - buttonsWidth,
+        //    e.Bounds.Height);
+
+        //    // 绘制文本
+        //    e.Graphics.DrawString(itemText, e.Font, textBrush, textRect);
+
+        //    // 按钮尺寸和位置
+        //    int buttonWidth = 90; // 按钮宽度
+        //    int buttonHeight = 25; // 按钮高度
+        //    int buttonPadding = 5; // 按钮与右侧的间距
+        //    int buttonSpacing = 10; // 按钮之间的间距
+
+        //    // 确认并处理按钮
+        //    Rectangle processButtonRect = new Rectangle(
+        //    e.Bounds.Right - buttonWidth - buttonPadding,
+        //    e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
+        //    buttonWidth,
+        //    buttonHeight);
+
+        //    // 确认按钮
+        //    Rectangle confirmButtonRect = new Rectangle(
+        //    processButtonRect.Left - buttonWidth - buttonSpacing,
+        //    e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
+        //    buttonWidth,
+        //    buttonHeight);
+
+        //    // 绘制确认按钮
+        //    using (LinearGradientBrush confirmBrush = new LinearGradientBrush(
+        //    confirmButtonRect,
+        //    Color.FromArgb(255, 100, 200, 100), // 绿色渐变起始颜色
+        //    Color.FromArgb(255, 50, 150, 50), // 绿色渐变结束颜色
+        //    LinearGradientMode.Vertical))
+        //    {
+        //        e.Graphics.FillRectangle(confirmBrush, confirmButtonRect);
+        //    }
+
+        //    // 绘制确认并处理按钮
+        //    using (LinearGradientBrush processBrush = new LinearGradientBrush(
+        //    processButtonRect,
+        //    Color.FromArgb(255, 100, 150, 255), // 蓝色渐变起始颜色
+        //    Color.FromArgb(255, 50, 100, 200), // 蓝色渐变结束颜色
+        //    LinearGradientMode.Vertical))
+        //    {
+        //        e.Graphics.FillRectangle(processBrush, processButtonRect);
+        //    }
+
+        //    // 绘制按钮边框（圆角）
+        //    using (Pen pen = new Pen(Color.FromArgb(255, 30, 80, 150), 1))
+        //    {
+        //        // 绘制确认按钮边框
+        //        DrawRoundedRectangle(e.Graphics, confirmButtonRect, 5, pen);
+
+        //        // 绘制确认并处理按钮边框
+        //        DrawRoundedRectangle(e.Graphics, processButtonRect, 5, pen);
+        //    }
+
+        //    // 按钮文本（居中）
+        //    using (StringFormat sf = new StringFormat())
+        //    {
+        //        sf.Alignment = StringAlignment.Center;
+        //        sf.LineAlignment = StringAlignment.Center;
+
+        //        // 绘制确认按钮文本
+        //        e.Graphics.DrawString("确认", e.Font, Brushes.White, confirmButtonRect, sf);
+
+        //        // 绘制确认并处理按钮文本
+        //        e.Graphics.DrawString("确认并处理", e.Font, Brushes.White, processButtonRect, sf);
+        //    }
+
+        //    e.DrawFocusRectangle();
+        //}
         private void LstCriticalValues_DrawItem(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= lstCriticalValues.Items.Count)
@@ -1098,84 +1425,119 @@ namespace CriticalValueSystem
 
             e.DrawBackground();
             string itemText = lstCriticalValues.Items[e.Index].ToString();
-            Brush textBrush = new SolidBrush(e.ForeColor);
+            //Brush textBrush = new SolidBrush(e.ForeColor);
+            // 使用 e.State 来判断是否选中，并设置不同的文本颜色
+            Brush textBrush = (e.State & DrawItemState.Selected) == DrawItemState.Selected
+                            ? Brushes.White
+                            : new SolidBrush(e.ForeColor);
+            // 计算文本区域，为两个按钮留出空间（如果显示）
+            int buttonsWidth = 0; // 默认无按钮
+            string nature = NatureType ?? "1"; // 默认 Nature 为 "1"
+            bool showConfirmButton = nature == "1" ? false : false; // 仅 Nature == "1" 显示确认按钮
+            bool showProcessButton = nature == "1" || nature == "3" || nature == "2"; // Nature == "1" 或 "3" 显示确认并处理/医技确认查阅按钮/护士确认
+            //string processButtonText = nature == "3" ? "确认查阅" : "确认并处理"; // 根据 Nature 设置按钮文本
+            string processButtonText = (nature == "2" || nature == "3" )? "确认查阅" : "确认并处理"; // 根据 Nature 设置按钮文本
+            // 根据按钮可见性计算占用的宽度
+            //if (showConfirmButton && showProcessButton)
+            //{
+            //    buttonsWidth = 170; // 两个按钮：90 + 10（间距）+ 90 - 10（padding）
+            //}
+            //else if (showProcessButton)
+            //{
+            //    buttonsWidth = 90; // 医生确认并处理/医技确认查阅按钮/护士确认
+            //}
+            //else if (showConfirmButton)
+            //{
+            //    buttonsWidth = 90; // 
+            //}
+            if (showProcessButton)
+            {
+                buttonsWidth = 90 + 5; // 按钮宽度 + 右侧内边距
+            }
+            //Rectangle textRect = new Rectangle(
+            //    e.Bounds.Left,
+            //    e.Bounds.Top,
+            //    e.Bounds.Width - buttonsWidth,
+            //    e.Bounds.Height);
 
-            // 计算文本区域，为两个按钮留出空间
-            int buttonsWidth = 170; // 两个按钮的总宽度加间距
+            // 定义文本绘制区域，它会使用 MeasureItem 计算出的完整高度
             Rectangle textRect = new Rectangle(
-            e.Bounds.Left,
-            e.Bounds.Top,
-            e.Bounds.Width - buttonsWidth,
-            e.Bounds.Height);
-
+                e.Bounds.Left + 5, // 左侧内边距
+                e.Bounds.Top + 6,  // 顶部内边距
+                e.Bounds.Width - buttonsWidth - 15, // 文本区域宽度
+                e.Bounds.Height - 12); // 文本区域高度
             // 绘制文本
             e.Graphics.DrawString(itemText, e.Font, textBrush, textRect);
 
             // 按钮尺寸和位置
-            int buttonWidth = 90; // 按钮宽度
-            int buttonHeight = 25; // 按钮高度
-            int buttonPadding = 5; // 按钮与右侧的间距
-            int buttonSpacing = 10; // 按钮之间的间距
+            int buttonWidth = 90;
+            int buttonHeight = 24;
+            int buttonPadding = 5;
+            int buttonSpacing = 10;
 
-            // 确认并处理按钮
+            // 定义按钮区域
             Rectangle processButtonRect = new Rectangle(
-            e.Bounds.Right - buttonWidth - buttonPadding,
-            e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
-            buttonWidth,
-            buttonHeight);
+                e.Bounds.Right - buttonWidth - buttonPadding,
+                e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
+                buttonWidth,
+                buttonHeight);
 
-            // 确认按钮
             Rectangle confirmButtonRect = new Rectangle(
-            processButtonRect.Left - buttonWidth - buttonSpacing,
-            e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
-            buttonWidth,
-            buttonHeight);
+                processButtonRect.Left - buttonWidth - buttonSpacing,
+                e.Bounds.Top + (e.Bounds.Height - buttonHeight) / 2,
+                buttonWidth,
+                buttonHeight);
 
-            // 绘制确认按钮
-            using (LinearGradientBrush confirmBrush = new LinearGradientBrush(
-            confirmButtonRect,
-            Color.FromArgb(255, 100, 200, 100), // 绿色渐变起始颜色
-            Color.FromArgb(255, 50, 150, 50), // 绿色渐变结束颜色
-            LinearGradientMode.Vertical))
+            // 绘制按钮（根据 Nature 决定是否绘制）
+            if (showConfirmButton)
             {
-                e.Graphics.FillRectangle(confirmBrush, confirmButtonRect);
-            }
-
-            // 绘制确认并处理按钮
-            using (LinearGradientBrush processBrush = new LinearGradientBrush(
-            processButtonRect,
-            Color.FromArgb(255, 100, 150, 255), // 蓝色渐变起始颜色
-            Color.FromArgb(255, 50, 100, 200), // 蓝色渐变结束颜色
-            LinearGradientMode.Vertical))
-            {
-                e.Graphics.FillRectangle(processBrush, processButtonRect);
-            }
-
-            // 绘制按钮边框（圆角）
-            using (Pen pen = new Pen(Color.FromArgb(255, 30, 80, 150), 1))
-            {
+                // 绘制确认按钮
+                using (LinearGradientBrush confirmBrush = new LinearGradientBrush(
+                    confirmButtonRect,
+                    Color.FromArgb(255, 100, 200, 100), // 绿色渐变起始颜色
+                    Color.FromArgb(255, 50, 150, 50), // 绿色渐变结束颜色
+                    LinearGradientMode.Vertical))
+                {
+                    e.Graphics.FillRectangle(confirmBrush, confirmButtonRect);
+                }
                 // 绘制确认按钮边框
-                DrawRoundedRectangle(e.Graphics, confirmButtonRect, 5, pen);
-
-                // 绘制确认并处理按钮边框
-                DrawRoundedRectangle(e.Graphics, processButtonRect, 5, pen);
+                using (Pen pen = new Pen(Color.FromArgb(255, 30, 80, 150), 1))
+                {
+                    DrawRoundedRectangle(e.Graphics, confirmButtonRect, 5, pen);
+                }
+                // 绘制确认按钮文本
+                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    e.Graphics.DrawString("确认", e.Font, Brushes.White, confirmButtonRect, sf);
+                }
             }
 
-            // 按钮文本（居中）
-            using (StringFormat sf = new StringFormat())
+            if (showProcessButton)
             {
-                sf.Alignment = StringAlignment.Center;
-                sf.LineAlignment = StringAlignment.Center;
-
-                // 绘制确认按钮文本
-                e.Graphics.DrawString("确认", e.Font, Brushes.White, confirmButtonRect, sf);
-
-                // 绘制确认并处理按钮文本
-                e.Graphics.DrawString("确认并处理", e.Font, Brushes.White, processButtonRect, sf);
+                // 绘制确认并处理/确认查阅按钮
+                using (LinearGradientBrush processBrush = new LinearGradientBrush(
+                    processButtonRect,
+                    Color.FromArgb(255, 100, 150, 255), // 蓝色渐变起始颜色
+                    Color.FromArgb(255, 50, 100, 200), // 蓝色渐变结束颜色
+                    LinearGradientMode.Vertical))
+                {
+                    e.Graphics.FillRectangle(processBrush, processButtonRect);
+                }
+                // 绘制按钮边框
+                using (Pen pen = new Pen(Color.FromArgb(255, 30, 80, 150), 1))
+                {
+                    DrawRoundedRectangle(e.Graphics, processButtonRect, 5, pen);
+                }
+                // 绘制按钮文本（根据 Nature 动态设置）
+                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    e.Graphics.DrawString(processButtonText, e.Font, Brushes.White, processButtonRect, sf);
+                }
             }
 
             e.DrawFocusRectangle();
         }
+
         // 辅助方法：绘制圆角矩形
         private void DrawRoundedRectangle(Graphics g, Rectangle rect, int cornerRadius, Pen pen)
         {
@@ -1189,18 +1551,45 @@ namespace CriticalValueSystem
         }
 
 
+        //private void LstCriticalValues_MeasureItem(object sender, MeasureItemEventArgs e)
+        //{
+        //     e.ItemHeight = 30; // 设置每项的高度
+
+        //}
+        // 此方法现在会动态计算每个列表项所需的高度
         private void LstCriticalValues_MeasureItem(object sender, MeasureItemEventArgs e)
         {
-             e.ItemHeight = 30; // 设置每项的高度
-            // 计算每个项目所需的高度
-            //string itemText = lstCriticalValues.Items[e.Index].ToString();
-            //using (Graphics g = lstCriticalValues.CreateGraphics())
-            //{
-            //    SizeF textSize = g.MeasureString(itemText, lstCriticalValues.Font);
-            //    e.ItemHeight = (int)Math.Ceiling(textSize.Height) + 4; // 增加一些额外的间距
-            //}
+            if (e.Index < 0 || e.Index >= lstCriticalValues.Items.Count)
+                return;
 
+            // 获取当前项的文本
+            string itemText = lstCriticalValues.Items[e.Index].ToString();
+
+            // 动态计算按钮区域的宽度，这必须与 DrawItem 中的逻辑保持一致
+            string nature =NatureType?? "1";
+            bool showProcessButton = nature == "1" || nature == "3" || nature == "2";
+            int buttonsWidth = 0;
+            if (showProcessButton)
+            {
+                buttonsWidth = 90 + 5; // 按钮宽度 + 右侧内边距
+            }
+
+            // 计算文本可以占用的宽度，需要减去按钮宽度和一些水平内边距
+            int textWidth = lstCriticalValues.ClientSize.Width - buttonsWidth - 15; // 额外减去15像素作为左右内边距
+
+            // 确保文本宽度为正数
+            if (textWidth <= 0) textWidth = 1;
+
+            // 使用 e.Graphics.MeasureString 来计算文本在指定宽度下自动换行所需的高度
+            SizeF textSize = e.Graphics.MeasureString(itemText, lstCriticalValues.Font, textWidth);
+
+            // 设置列表项的高度，等于文本高度并加上一些垂直内边距以美化界面
+            int itemHeight = (int)Math.Ceiling(textSize.Height) + 12; // 上下各6像素内边距
+
+            // 确保一个最小高度，避免空内容或短内容时项太矮
+            e.ItemHeight = Math.Max(35, itemHeight);
         }
+
 
         // 2. 修改鼠标点击事件处理，区分两个按钮的点击
 
@@ -1222,6 +1611,15 @@ namespace CriticalValueSystem
 
             if (value == null) // 如果没有获取到对象，直接返回
                 return;
+
+            //// 获取 Nature，决定按钮行为
+            //string nature = NatureType ?? "1";
+
+            //if (nature == "2")
+            //{
+            //    // Nature == "2"：不显示按钮，直接返回
+            //    return;
+            //}
 
             // 计算按钮区域
             Rectangle itemRect = lstCriticalValues.GetItemRectangle(index);
@@ -1329,9 +1727,11 @@ namespace CriticalValueSystem
                 checkTimeout = requiresTimeoutAction;
             }
 
-            //CA签名
+
+
+            //医生需要CA签名
             //APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"" + strScene + "\"}", out string strInfo);
-            if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo)) {
+            if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo, out string strInfoName)) {
 
                 // CA签名后获取Token
                 await TimeoutGetAccessTokenAsync(strInfo);
@@ -1344,7 +1744,7 @@ namespace CriticalValueSystem
                     if (currentStatus != null)
                     {
                         // --- 如果已超时 (timeoutCount > 0) ---
-                        if (currentStatus.TimeoutCount == 1)
+                        if (currentStatus.TimeoutCount > 0)
                         {
                             Console.WriteLine($"{DateTime.Now}: 危急值已超时 (TimeoutCount={currentStatus.TimeoutCount})，需要补救措施。");
                             // 弹出提示框
@@ -1515,130 +1915,437 @@ namespace CriticalValueSystem
         private async void ConfirmAndProcessCriticalValue(CriticalValue value)
         {
 
-
+            string nature = NatureType ?? "1";
             bool checkTimeout = false;
-            lock (timeoutActionLock) // 读取服务器设置
+            lock (timeoutActionLock) // 读取服务器设置是否超时补救
             {
                 checkTimeout = requiresTimeoutAction;
             }
-            //CA签名
-            //APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"" + strScene + "\"}", out string strInfo);
-            if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo))
+
+
+
+            bool checkCA = false;
+            lock (enabledCALock) // 读取服务器设置医技科室是否CA
             {
+                checkCA = enabledCa;
+            }
 
-                // CA签名后获取Token
-                await TimeoutGetAccessTokenAsync(strInfo);
-                // --- 如果服务器设置要求检查超时 ---
-                if (checkTimeout)
+
+
+            //先判断是否是医技科室
+            if (nature == "3")
+            {
+                //判断是否需要进行CA
+                if (checkCA)
                 {
-                    Console.WriteLine($"{DateTime.Now}: 服务器设置要求检查超时状态 (criticalId: {value.criticalId})");
-                    ApiCriticalValueRow currentStatus = await GetCurrentCriticalValueStatusAsync(value.criticalId);
-
-                    if (currentStatus != null)
+                    //CA签名
+                    //APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"" + strScene + "\"}", out string strInfo);
+                    if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfoYJID, out string strInfoYJName))
                     {
-                        // --- 如果已超时 (timeoutCount > 0) ---
-                        if (currentStatus.TimeoutCount == 1)
+                        try
                         {
-                            Console.WriteLine($"{DateTime.Now}: 危急值已超时 (TimeoutCount={currentStatus.TimeoutCount})，需要补救措施。");
-                            // 弹出提示框
-                            var confirmResult = MessageBox.Show("当前危急值已超时，需要填写补救措施。",
-                                                                "超时提醒",
-                                                                MessageBoxButtons.OK, // 只提供确认按钮
-                                                                MessageBoxIcon.Warning);
 
-                            // 不论用户点什么，直接跳转到处理页面
-                            Console.WriteLine($"{DateTime.Now}: 用户确认超时提醒，跳转到处理页面。");
+                            //先判断危急值有没有被处理
+                            // 检查危急值是否被处理
+                            bool isProcessed = await CheckCriticalValueProcessStatusAsync(value.criticalId);
+                            
+                            if (!isProcessed)
+                            { //未处理给出提示
+                                MessageBox.Show("该危急值未处理，请通知医生处理。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
 
-                            TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
+                            }
+                            // 先查阅危急值
+                            var requestData = new
+                            {
+                                viewerId = strInfoYJID,
+                                criticalId = value.criticalId,
+                                viewerName = strInfoYJName
+                            };
 
-                            MinimizeFormToTray(); // 最小化客户端
-                                                  //return; // *** 结束执行，不调用确认API，不移除本地数据 ***
-                                                  // 确认成功，从本地列表中移除 (重要：仅在非超时跳转时执行)
-                            RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
-                            return; // *** 结束执行，不调用确认API，不移除本地数据 ***
+                            string jsonData = JsonConvert.SerializeObject(requestData);
+                            var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
+
+
+                            // 添加token到请求头 (确保httpClient和accessToken有效)
+                            if (string.IsNullOrEmpty(accessToken))
+                            {
+                                MessageBox.Show("无法确认处理：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
+                            }
+                            httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+                            HttpResponseMessage response = await httpClient.PostAsync($"{ApiBaseUrl}/web/main/submitView", content);
+
+                            if (response.IsSuccessStatusCode)
+                            {
+                                string responseBody = await response.Content.ReadAsStringAsync();
+                                var responseObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(responseBody);
+
+
+                                if (responseObj != null && responseObj.ContainsKey("code") && responseObj["code"].ToString() == "200")
+                                {
+                                    // 查阅成功，从列表中移除
+                                    RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                    // MinimizeFormToTray(); // 处理危急值的时候窗体隐藏到托盘
+                                    //查阅结束退出，不执行后面的操作了
+                                    return;
+                                }
+                                else
+                                {
+                                    MessageBox.Show($"查阅失败: {responseObj?["msg"]}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    //MessageBox.Show("无法确认：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    return;
+                                }
+                            }
+                            else
+                            {
+                                MessageBox.Show($"查阅请求失败，状态码: {response.StatusCode}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
+                            }
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            Console.WriteLine($"{DateTime.Now}: 危急值未超时 (TimeoutCount={currentStatus.TimeoutCount})，执行正常确认流程。");
-                            // 未超时，继续执行下面的正常确认流程
+                            MessageBox.Show($"查阅过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
                         }
-                    }
-                    else
-                    {
-                        Console.WriteLine($"{DateTime.Now}: 无法获取危急值当前状态，执行正常确认流程作为后备。");
-                        // 获取状态失败，可以决定是阻止确认还是按正常流程处理（这里选择正常流程）
-                        MessageBox.Show("获取超时状态失败,请重试", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        return;
                     }
                 }
                 else
                 {
-                    Console.WriteLine($"{DateTime.Now}: 服务器设置不要求检查超时，执行正常确认流程。");
-                    // 服务器没要求检查，也执行下面的正常确认流程
+
+                    try
+                    {
+
+                        //先判断危急值有没有被处理
+                        // 检查危急值是否被处理
+                        bool isProcessed = await CheckCriticalValueProcessStatusAsync(value.criticalId);
+                        //ClsPublic.WriteLog($"检查危急值是否被处理：{isProcessed}", 3);
+                        if (!isProcessed){ //未处理给出提示
+                            MessageBox.Show("该危急值未处理，请通知医生处理。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+
+                        }
+
+                        // 先查阅危急值
+                        var requestData = new
+                        {
+                            viewerId = currentUser.UserId,
+                            criticalId = value.criticalId,
+                            viewerName = currentUser.UserName
+                        };
+
+                        string jsonData = JsonConvert.SerializeObject(requestData);
+                        var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
+
+
+                        // 添加token到请求头 (确保httpClient和accessToken有效)
+                        if (string.IsNullOrEmpty(accessToken))
+                        {
+                            MessageBox.Show("无法查阅：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+                        httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+                        HttpResponseMessage response = await httpClient.PostAsync($"{ApiBaseUrl}/web/main/submitView", content);
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            string responseBody = await response.Content.ReadAsStringAsync();
+                            var responseObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(responseBody);
+
+
+                            if (responseObj != null && responseObj.ContainsKey("code") && responseObj["code"].ToString() == "200")
+                            {
+                                // 查阅成功，从列表中移除
+                                RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                //MinimizeFormToTray(); // 处理危急值的时候窗体隐藏到托盘
+                                //查阅结束退出，不执行后面的操作了
+                                return;
+                            }
+                            else
+                            {
+                                MessageBox.Show($"查阅失败: {responseObj?["msg"]}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                //MessageBox.Show("无法确认：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            MessageBox.Show($"查阅请求失败，状态码: {response.StatusCode}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"查阅过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                    }
+
 
                 }
 
 
+            }
+            else if (nature == "1")//医生
+            {
 
-                try
+                //CA签名
+                //APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"" + strScene + "\"}", out string strInfo);
+                if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo, out string strInfoName))
                 {
-                    // 先确认危急值
-                    var requestData = new
+
+                    // CA签名后获取Token
+                    await TimeoutGetAccessTokenAsync(strInfo);
+                    // --- 如果服务器设置要求检查超时 ---
+                    if (checkTimeout)
                     {
-                        doctorId = strInfo,
-                        criticalId = value.criticalId,
-                        confirmResult = "确认有效"
-                    };
+                        Console.WriteLine($"{DateTime.Now}: 服务器设置要求检查超时状态 (criticalId: {value.criticalId})");
+                        ApiCriticalValueRow currentStatus = await GetCurrentCriticalValueStatusAsync(value.criticalId);
 
-                    string jsonData = JsonConvert.SerializeObject(requestData);
-                    var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
-
-
-                    // 添加token到请求头 (确保httpClient和accessToken有效)
-                    if (string.IsNullOrEmpty(TimeoutaccessToken))
-                    {
-                        MessageBox.Show("无法确认处理：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        return;
-                    }
-                    httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", TimeoutaccessToken);
-
-                    HttpResponseMessage response = await httpClient.PostAsync($"{ApiBaseUrl}/web/main/confirmCritical", content);
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        string responseBody = await response.Content.ReadAsStringAsync();
-                        var responseObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(responseBody);
-
-
-                        if (responseObj != null && responseObj.ContainsKey("code") && responseObj["code"].ToString() == "200")
+                        if (currentStatus != null)
                         {
-                            // 确认成功，从列表中移除
-                            RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
-                            // 确认成功，打开处理页面
-                            //OpenWebPage(value.patientId, value.criticalId);
+                            // --- 如果已超时 (timeoutCount > 0) ---
+                            if (currentStatus.TimeoutCount > 0)
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 危急值已超时 (TimeoutCount={currentStatus.TimeoutCount})，需要补救措施。");
+                                // 弹出提示框
+                                var confirmResult = MessageBox.Show("当前危急值已超时，需要填写补救措施。",
+                                                                    "超时提醒",
+                                                                    MessageBoxButtons.OK, // 只提供确认按钮
+                                                                    MessageBoxIcon.Warning);
+
+                                // 不论用户点什么，直接跳转到处理页面
+                                Console.WriteLine($"{DateTime.Now}: 用户确认超时提醒，跳转到处理页面。");
+
+                                TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
+
+                                MinimizeFormToTray(); // 最小化客户端
+                                                      //return; // *** 结束执行，不调用确认API，不移除本地数据 ***
+                                                      // 确认成功，从本地列表中移除 (重要：仅在非超时跳转时执行)
+                                RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                return; // *** 结束执行，不调用确认API，不移除本地数据 ***
+                            }
+                            else
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 危急值未超时 (TimeoutCount={currentStatus.TimeoutCount})，执行正常确认流程。");
+                                // 未超时，继续执行下面的正常确认流程
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 无法获取危急值当前状态，执行正常确认流程作为后备。");
+                            // 获取状态失败，可以决定是阻止确认还是按正常流程处理（这里选择正常流程）
+                            MessageBox.Show("获取超时状态失败,请重试", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 服务器设置不要求检查超时，执行正常确认流程。");
+                        // 服务器没要求检查，也执行下面的正常确认流程
+
+                    }
+
+
+
+                    try
+                    {
+                        //先判断危急值有没有被确认
+                        // 检查危急值是否已确认
+                        bool isConfirmed = await CheckCriticalValueConfirmationStatusAsync(value.criticalId);
+                        if (isConfirmed) {
 
                             TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
                             MinimizeFormToTray(); // 处理危急值的时候窗体隐藏到托盘
                         }
                         else
                         {
-                            MessageBox.Show($"确认失败: {responseObj?["msg"]}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                            //MessageBox.Show("无法确认：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            // 先确认危急值
+                            var requestData = new
+                            {
+                                doctorId = strInfo,
+                                criticalId = value.criticalId,
+                                confirmResult = "确认有效"
+                            };
+
+                            string jsonData = JsonConvert.SerializeObject(requestData);
+                            var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
+
+
+                            // 添加token到请求头 (确保httpClient和accessToken有效)
+                            if (string.IsNullOrEmpty(TimeoutaccessToken))
+                            {
+                                MessageBox.Show("无法确认处理：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
+                            }
+                            httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", TimeoutaccessToken);
+
+                            HttpResponseMessage response = await httpClient.PostAsync($"{ApiBaseUrl}/web/main/confirmCritical", content);
+
+                            if (response.IsSuccessStatusCode)
+                            {
+                                string responseBody = await response.Content.ReadAsStringAsync();
+                                var responseObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(responseBody);
+
+
+                                if (responseObj != null && responseObj.ContainsKey("code") && responseObj["code"].ToString() == "200")
+                                {
+                                    // 确认成功，从列表中移除
+                                    //RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                    // 确认成功，打开处理页面
+                                    //OpenWebPage(value.patientId, value.criticalId);
+
+                                    TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
+                                    MinimizeFormToTray(); // 处理危急值的时候窗体隐藏到托盘
+                                }
+                                else
+                                {
+                                    MessageBox.Show($"确认失败: {responseObj?["msg"]}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    //MessageBox.Show("无法确认：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                    return;
+                                }
+                            }
+                            else
+                            {
+                                MessageBox.Show($"确认请求失败，状态码: {response.StatusCode}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            }
+                        }
+
+
+
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"确认并处理过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+
+
+                }
+
+            }
+            else if (nature == "2") {//护士
+                //CA签名
+                //APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"" + strScene + "\"}", out string strInfo);
+                if (APP_CheckCertificate("{\"LoginUser\":\"" + currentUser.UserId + "\",\"Scene\":\"1\"}", out string strInfo, out string strInfoName))
+                {
+
+                    // CA签名后获取Token
+                    await TimeoutGetAccessTokenAsync(strInfo);
+                    // --- 如果服务器设置要求检查超时 ---
+                    if (checkTimeout)
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 服务器设置要求检查超时状态 (criticalId: {value.criticalId})");
+                        ApiCriticalValueRow currentStatus = await GetCurrentCriticalValueStatusAsync(value.criticalId);
+
+                        if (currentStatus != null)
+                        {
+                            // --- 如果已超时 (timeoutCount > 0) ---
+                            if (currentStatus.TimeoutCount > 0)
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 危急值已超时 (TimeoutCount={currentStatus.TimeoutCount})，需要补救措施。");
+                                // 弹出提示框
+                                var confirmResult = MessageBox.Show("当前危急值已超时，需要填写补救措施。",
+                                                                    "超时提醒",
+                                                                    MessageBoxButtons.OK, // 只提供确认按钮
+                                                                    MessageBoxIcon.Warning);
+
+                                // 不论用户点什么，直接跳转到处理页面
+                                Console.WriteLine($"{DateTime.Now}: 用户确认超时提醒，跳转到处理页面。");
+
+                                TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
+
+                                MinimizeFormToTray(); // 最小化客户端
+                                                      //return; // *** 结束执行，不调用确认API，不移除本地数据 ***
+                                                      // 确认成功，从本地列表中移除 (重要：仅在非超时跳转时执行)
+                                RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                return; // *** 结束执行，不调用确认API，不移除本地数据 ***
+                            }
+                            else
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 危急值未超时 (TimeoutCount={currentStatus.TimeoutCount})，执行正常确认流程。");
+                                // 未超时，继续执行下面的正常确认流程
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 无法获取危急值当前状态，执行正常确认流程作为后备。");
+                            // 获取状态失败，可以决定是阻止确认还是按正常流程处理（这里选择正常流程）
+                            MessageBox.Show("获取超时状态失败,请重试", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
                             return;
                         }
                     }
                     else
                     {
-                        MessageBox.Show($"确认请求失败，状态码: {response.StatusCode}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"确认并处理过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
+                        Console.WriteLine($"{DateTime.Now}: 服务器设置不要求检查超时，执行正常确认流程。");
+                        // 服务器没要求检查，也执行下面的正常确认流程
 
+                    }
+
+
+
+                    try
+                    {
+                        // 先确认危急值
+                        var requestData = new
+                        {
+                            doctorId = strInfo,
+                            criticalId = value.criticalId,
+                            confirmResult = "确认有效"
+                        };
+
+                        string jsonData = JsonConvert.SerializeObject(requestData);
+                        var content = new StringContent(jsonData, Encoding.UTF8, "application/json");
+
+
+                        // 添加token到请求头 (确保httpClient和accessToken有效)
+                        if (string.IsNullOrEmpty(TimeoutaccessToken))
+                        {
+                            MessageBox.Show("无法确认处理：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            return;
+                        }
+                        httpClient.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", TimeoutaccessToken);
+
+                        HttpResponseMessage response = await httpClient.PostAsync($"{ApiBaseUrl}/web/main/confirmNurseCritical", content);
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            string responseBody = await response.Content.ReadAsStringAsync();
+                            var responseObj = JsonConvert.DeserializeObject<Dictionary<string, object>>(responseBody);
+
+
+                            if (responseObj != null && responseObj.ContainsKey("code") && responseObj["code"].ToString() == "200")
+                            {
+                                // 确认成功，从列表中移除
+                                RemoveProcessedData(value.patientId, value.criticalId, value.itemCode);
+                                // 确认成功，打开处理页面
+                                //OpenWebPage(value.patientId, value.criticalId);
+
+                                //TimeoutOpenWebPage(value.patientId, value.criticalId); // 打开处理页面
+                                MinimizeFormToTray(); // 处理危急值的时候窗体隐藏到托盘
+                            }
+                            else
+                            {
+                                MessageBox.Show($"确认失败: {responseObj?["msg"]}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                //MessageBox.Show("无法确认：用户未登录或会话已过期。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                                return;
+                            }
+                        }
+                        else
+                        {
+                            MessageBox.Show($"确认请求失败，状态码: {response.StatusCode}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show($"确认并处理过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+
+
+                }
 
             }
+
 
         }
 
@@ -1784,7 +2491,7 @@ namespace CriticalValueSystem
         {
             string message = $"发现新版本 {updateInfo.VersionId}！\n\n更新内容：\n{updateInfo.ReleaseNotes}\n\n{(updateInfo.IsMandatory == 1 ? "此为强制更新。" : "是否立即更新？")}";
             MessageBoxButtons buttons = updateInfo.IsMandatory == 1 ? MessageBoxButtons.OK : MessageBoxButtons.YesNo;
-            DialogResult dialogResult = MessageBox.Show(this, message, "更新提示", buttons, MessageBoxIcon.Information);
+            DialogResult dialogResult = MessageBox.Show(this, message, "危急值更新提示", buttons, MessageBoxIcon.Information);
 
             if (updateInfo.IsMandatory == '1' || dialogResult == DialogResult.Yes || dialogResult == DialogResult.OK)
             {
@@ -1902,7 +2609,24 @@ namespace CriticalValueSystem
                 await Task.Delay(1000); // 让用户看到 "下载完成" 或 "更新器下载完成"
                 CloseDownloadProgressForm(); // <<< 在启动Updater之前，关闭进度窗体
 
-
+                // *** 关键修改：准备并传递登录信息 ***
+                string loginInfoArgument = "";
+                if (currentUser != null && !string.IsNullOrEmpty(currentUser.UserId))
+                {
+                    try
+                    {
+                        // 将当前用户信息序列化为JSON
+                        string loginInfoJson = JsonConvert.SerializeObject(currentUser);
+                        // 使用Base64编码以避免命令行特殊字符问题
+                        loginInfoArgument = Convert.ToBase64String(Encoding.UTF8.GetBytes(loginInfoJson));
+                        
+                    }
+                    catch (Exception ex)
+                    {
+                     
+                        // 即使失败，也继续更新，只是不会自动登录
+                    }
+                }
                 // 3. 启动Updater.exe并退出主程序
                 string mainAppPath = System.Reflection.Assembly.GetExecutingAssembly().Location;
                 string mainAppDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -1911,7 +2635,7 @@ namespace CriticalValueSystem
                 ProcessStartInfo startInfo = new ProcessStartInfo
                 {
                     FileName = updaterPath,
-                    Arguments = $"\"{downloadPath}\" \"{effectiveMainAppDir}\" \"{Path.GetFileName(mainAppPath)}\"",
+                    Arguments = $"\"{downloadPath}\" \"{effectiveMainAppDir}\" \"{Path.GetFileName(mainAppPath)}\" \"{loginInfoArgument}\"",
                     UseShellExecute = true, // 使用ShellExecute以方便请求管理员权限（如果需要）
                     Verb = "runas" // 尝试请求管理员权限，如果Updater需要写保护目录
                 };
@@ -2245,12 +2969,70 @@ namespace CriticalValueSystem
             }
         }
 
+        /// <summary>
+        /// 【新增方法】处理来自服务端的状态更新或新数据推送。
+        /// </summary>
+        /// <param name="valuesToUpdate">从服务器接收到的危急值列表。</param>
+        private void UpdateOrAddCriticalValues(List<CriticalValue> valuesToUpdate)
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(() => UpdateOrAddCriticalValues(valuesToUpdate)));
+                return;
+            }
+
+            bool listChanged = false;
+            lock (criticalValuesLock)
+            {
+                foreach (var updatedValueFromServer in valuesToUpdate)
+                {
+                   // ClsPublic.WriteLog($"{updatedValueFromServer}", 3);
+                    // 尝试在现有列表中通过 criticalId 查找条目
+                    var existingValue = criticalValues.FirstOrDefault(v => v.criticalId == updatedValueFromServer.criticalId);
+
+                    if (existingValue != null)
+                    {
+                        // 条目已存在，直接更新其状态属性
+                        existingValue.Status = updatedValueFromServer.Status; // 例如，服务器应推送 "已处理"
+                        existingValue.confirmStatus = updatedValueFromServer.confirmStatus; // 例如，服务器应推送 "已确认"
+                        // 可根据需要更新其他字段
+
+                        Console.WriteLine($"{DateTime.Now}: 通过 /api/updateStatus 更新了危急值 [{existingValue.criticalId}] 的状态。新状态: {existingValue.Status}");
+                       // ClsPublic.WriteLog($"{DateTime.Now}: 通过 /api/updateStatus 更新了危急值 [{existingValue.criticalId}] 的状态。Status新状态: {existingValue.Status},confirmStatus新状态: {existingValue.confirmStatus}", 3);
+                        listChanged = true;
+                    }
+                    else
+                    {
+                        // 条目不存在，将其作为新数据添加到列表中
+                        criticalValues.Add(updatedValueFromServer);
+                        Console.WriteLine($"{DateTime.Now}: 通过 /api/updateStatus 添加了新的危急值 [{updatedValueFromServer.criticalId}]。");
+                        listChanged = true;
+                    }
+                }
+            }
+
+            // 如果列表发生了任何变化，则刷新UI
+            if (listChanged)
+            {
+                Console.WriteLine($"{DateTime.Now}: 由 /api/updateStatus 触发UI更新。");
+                UpdateCriticalValueList(); // 此方法会重新排序并使用最新状态重新渲染列表
+                UpdateTrayIconText();
+
+                // 如果列表不为空，则弹出窗口并开始闪烁
+                if (criticalValues.Any())
+                {
+                    ShowAndFocusForm();
+                    StartBlinking();
+                }
+            }
+        }
+
         // 处理 HTTP 请求
         private void ProcessRequest(HttpListenerContext context)
         {
             try
             {
-                if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalValue")
+                if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalValue")//医生和护士客户端接收危急值数据
                 {
                     // 处理危急值数据
                     using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
@@ -2275,23 +3057,167 @@ namespace CriticalValueSystem
                         }
                     }
                 }
-                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalConfirm")
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/processed") //医生客户端接收处理完的数据
+                {
+                    // 处理完成服务端调用客户端接口
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        var processedData = JsonConvert.DeserializeObject<List<ProcessedData>>(requestBody);
+                        
+                        // 3. 遍历排序后的 List，添加项到 ListBox
+                        foreach (var value in processedData)
+                        {
+                            if (processedData != null &&
+                                !string.IsNullOrEmpty(value.CriticalId))
+                            {
+
+                                RemoveProcessedData(value.patientId, value.CriticalId, value.itemCode);
+                                // 更新按钮可见性（现在会考虑列表是否为空）
+                                ApplyCurrentButtonVisibilitySetting(); // <--- 调用更新
+
+                                UpdateFormTitle(null, GetUnprocessedCriticalValueCount());
+                                UpdateTrayIconText();
+                                ShowAndFocusForm(); // 处理完成后重新显示窗体
+                                if (criticalValues.Count == 0)
+                                {
+                                    StopBlinking();
+                                    MinimizeFormToTray();
+                                }
+                                SendSuccessResponse(context);
+                            }
+                            else
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            }
+                        }
+
+
+                    }
+                }
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalConfirm")//医生确认完会调用这个接口
                 {
 
+
+                    //服务端调用确认按钮
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        var processedData = JsonConvert.DeserializeObject<List<ProcessedData>>(requestBody);
+                        // 3. 遍历排序后的 List，添加项到 ListBox
+                        foreach (var value in processedData)
+                        {
+                            if (processedData != null &&
+                                !string.IsNullOrEmpty(value.CriticalId))
+                            {
+                                 MinimizeFormToTray();
+                                // 首先关闭对应的浏览器
+                               // CloseBrowser(value.patientId, value.CriticalId);
+
+                               // RemoveProcessedData(value.patientId, value.CriticalId, value.itemCode);
+                                context.Response.StatusCode = (int)HttpStatusCode.OK;
+                                context.Response.ContentType = "application/json";
+                                //string responseBody = JsonConvert.SerializeObject(new { success = true });
+                                string responseBody = "true";
+                                byte[] buffer = Encoding.UTF8.GetBytes(responseBody);
+                                context.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                            }
+                            else
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            }
+                        }
+                    }
+                }
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalValueProcessed")//接收已处理的数据(暂时没用到)
+                {
+
+
+                    // 处理危急值数据
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        var values = JsonConvert.DeserializeObject<List<CriticalValue>>(requestBody);
+                        Console.WriteLine(requestBody);
+                        if (values != null && values.Any())
+                        {
+
+                            ProcessCriticalValueData(values);
+                            context.Response.StatusCode = (int)HttpStatusCode.OK;
+                            context.Response.ContentType = "application/json";
+                            //string responseBody = JsonConvert.SerializeObject(new { success = true });
+                            string responseBody = "true";
+                            byte[] buffer = Encoding.UTF8.GetBytes(responseBody);
+                            context.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                        }
+                        else
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        }
+                    }
+                }
+                // ******************** 新增接口处理逻辑 ********************
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/updateStatus")
+                {
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        // 假设服务器推送的数据结构与CriticalValue一致
+                        var valuesToUpdate = JsonConvert.DeserializeObject<List<CriticalValue>>(requestBody);
+                        if (valuesToUpdate != null && valuesToUpdate.Any())
+                        {
+                            // 调用新方法处理更新或添加逻辑
+                            UpdateOrAddCriticalValues(valuesToUpdate);
+                            SendSuccessResponse(context); // 确认收到请求
+                        }
+                        else
+                        {
+                            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                        }
+                    }
+                }
+                // ******************** 结束新增逻辑 ********************
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalViewConfirm")//查阅后调用
+                {
 
                     // 处理已处理数据
                     using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
                     {
                         string requestBody = reader.ReadToEnd();
                         var processedData = JsonConvert.DeserializeObject<List<ProcessedData>>(requestBody);
-                        //var processedData = JsonConvert.DeserializeObject<ProcessedData>(requestBody);
-                        //var values = JsonConvert.DeserializeObject<List<CriticalValue>>(requestBody);
-                        //if (processedData != null &&
-                        //                   !string.IsNullOrEmpty(processedData.patientId) &&
-                        //                   !string.IsNullOrEmpty(processedData.exReportId) &&
-                        //                   !string.IsNullOrEmpty(processedData.itemCode))
+                        // 3. 遍历排序后的 List，添加项到 ListBox
+                        foreach (var value in processedData)
+                        {
+                            if (processedData != null &&
+                                !string.IsNullOrEmpty(value.CriticalId))
+                            {
 
+                                // 首先关闭对应的浏览器
+                               // CloseBrowser(value.patientId, value.CriticalId);
 
+                                RemoveProcessedData(value.patientId, value.CriticalId, value.itemCode);
+                                context.Response.StatusCode = (int)HttpStatusCode.OK;
+                                context.Response.ContentType = "application/json";
+                                //string responseBody = JsonConvert.SerializeObject(new { success = true });
+                                string responseBody = "true";
+                                byte[] buffer = Encoding.UTF8.GetBytes(responseBody);
+                                context.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                            }
+                            else
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            }
+                        }
+                    }
+                }
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalNurseConfirm")//护士确认完会调用
+                {
+
+                    // 处理已处理数据
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        var processedData = JsonConvert.DeserializeObject<List<ProcessedData>>(requestBody);
                         // 3. 遍历排序后的 List，添加项到 ListBox
                         foreach (var value in processedData)
                         {
@@ -2315,29 +3241,42 @@ namespace CriticalValueSystem
                                 context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
                             }
                         }
-
-
-                        //if (processedData != null &&                            
-                        //    !string.IsNullOrEmpty(processedData.CriticalId) )
-                        //{
-
-                        //    // 首先关闭对应的浏览器
-                        //    CloseBrowser(processedData.patientId, processedData.CriticalId);
-
-                        //    RemoveProcessedData(processedData.patientId, processedData.CriticalId, processedData.itemCode);
-                        //    context.Response.StatusCode = (int)HttpStatusCode.OK;
-                        //    context.Response.ContentType = "application/json";
-                        //    //string responseBody = JsonConvert.SerializeObject(new { success = true });
-                        //    string responseBody = "true";
-                        //    byte[] buffer = Encoding.UTF8.GetBytes(responseBody);
-                        //    context.Response.OutputStream.Write(buffer, 0, buffer.Length);
-                        //}
-                        //else
-                        //{
-                        //    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                        //}
                     }
                 }
+                else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/criticalValueCancle")//危急值取消后调用
+                {
+
+                    // 处理已处理数据
+                    using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
+                    {
+                        string requestBody = reader.ReadToEnd();
+                        var processedData = JsonConvert.DeserializeObject<List<ProcessedData>>(requestBody);
+                        // 3. 遍历排序后的 List，添加项到 ListBox
+                        foreach (var value in processedData)
+                        {
+                            if (processedData != null &&
+                                !string.IsNullOrEmpty(value.CriticalId))
+                            {
+
+                                // 首先关闭对应的浏览器
+                                //CloseBrowser(value.patientId, value.CriticalId);
+
+                                RemoveProcessedData(value.patientId, value.CriticalId, value.itemCode);
+                                context.Response.StatusCode = (int)HttpStatusCode.OK;
+                                context.Response.ContentType = "application/json";
+                                //string responseBody = JsonConvert.SerializeObject(new { success = true });
+                                string responseBody = "true";
+                                byte[] buffer = Encoding.UTF8.GetBytes(responseBody);
+                                context.Response.OutputStream.Write(buffer, 0, buffer.Length);
+                            }
+                            else
+                            {
+                                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                            }
+                        }
+                    }
+                }
+
                 // 新增：单点登录接口
                 else if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/api/login")
                 {
@@ -2354,6 +3293,11 @@ namespace CriticalValueSystem
                             currentUser = loginInfo;
                             isUserLoggedIn = true;
 
+                            // 重置 isPolling，确保登录后的首次数据获取不被阻止
+                            lock (pollingLock)
+                            {
+                                isPolling = false;
+                            }
                             // 使用委托异步更新UI
                             this.BeginInvoke(new Action(() => {
                                 try
@@ -2381,7 +3325,7 @@ namespace CriticalValueSystem
                                     Console.WriteLine($"{DateTime.Now}: Token acquired successfully after login.");
 
                                     // 登录时检查更新 (服务器)
-                                   // await CheckForUpdatesAsync(); // 调用新的服务器检查方法 
+                                   await CheckForUpdatesAsync(); // 调用新的服务器检查方法 
                                     // **** 新增：获取按钮可见性设置 ****
                                     await FetchButtonVisibilitySettingAsync();
                                     // **** 新增：获取补救措施 ****
@@ -2390,10 +3334,23 @@ namespace CriticalValueSystem
                                     // **** 新增：获取医技CA开启 ****
                                     await FetchEnabledCaSettingAsync(); // <-- 新增调用
 
-                                    // **** 获取初始数据和数量 ****
-                                    // 1. 获取未确认列表（会更新本地列表）
-                                    await FetchUnconfirmedCriticalValuesAsync(); // 这个方法内部会调用 Reconcile...
+                                    // **** 新增点: 获取提醒间隔 ****
+                                    await FetchReminderIntervalSettingAsync(); // <-- 新增调用
 
+                                    //// **** 获取初始数据和数量 ****
+                                    //// 1. 获取未确认列表（会更新本地列表）
+                                    //await FetchUnconfirmedCriticalValuesAsync(); // 这个方法内部会调用 Reconcile...
+                                    // **** 根据 Nature 决定获取初始数据 ****
+                                    if (NatureType== "3")
+                                    {
+                                        Console.WriteLine($"{DateTime.Now}: Nature=3，获取已处理未查阅危急值数据。");
+                                        await FetchProcessedUnviewedCriticalValuesAsync();
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"{DateTime.Now}: Nature={NatureType}，获取未确认危急值数据。");
+                                        await FetchUnconfirmedCriticalValuesAsync();
+                                    }
 
                                     // 2. 获取待处理数量 (在Reconcile之后调用，确保本地列表更新完再取待处理数)
                                     // （或者将获取待处理数逻辑移到 ReconcileAndProcessPolledData 方法末尾）
@@ -2627,28 +3584,75 @@ namespace CriticalValueSystem
         // 初始化定时器
         private void InitializeTimer()
         {
-            heartbeatTimer = new System.Timers.Timer(30000); // 30 秒
+            heartbeatTimer = new System.Timers.Timer(10000); // 30 秒
             heartbeatTimer.Elapsed += async (sender, e) => await SendHeartbeatAsync();
             heartbeatTimer.AutoReset = true; // 设置为重复执行
             heartbeatTimer.Enabled = false; // 初始状态为禁用
         }
         // New method to initialize the polling timer
         //查询未确认的定时器
+        //private void InitializePollingTimer()
+        //{
+        //    pollingTimer = new System.Timers.Timer(70000); // 60 seconds interval
+        //    //pollingTimer.Elapsed += async (sender, e) =>
+        //    //{
+        //    //    // 同时轮询危急值和设置
+        //    //    await PollUnconfirmedCriticalValuesAsync();//获取待确认
+        //    //    await FetchButtonVisibilitySettingAsync();按钮可见性
+        //    //    await FetchTimeoutActionSettingAsync(); // <-- 新增调用 超时补救设置
+        //    //};
+        //    pollingTimer.Elapsed += async (sender, e) => await FetchUnconfirmedCriticalValuesAsync();
+        //    pollingTimer.AutoReset = true; // Keep polling
+        //    pollingTimer.Enabled = false; // Start disabled
+        //}
+        //查询未确认、未查阅的定时器
         private void InitializePollingTimer()
         {
-            pollingTimer = new System.Timers.Timer(70000); // 60 seconds interval
-            //pollingTimer.Elapsed += async (sender, e) =>
-            //{
-            //    // 同时轮询危急值和设置
-            //    await PollUnconfirmedCriticalValuesAsync();//获取待确认
-            //    await FetchButtonVisibilitySettingAsync();按钮可见性
-            //    await FetchTimeoutActionSettingAsync(); // <-- 新增调用 超时补救设置
-            //};
-            pollingTimer.Elapsed += async (sender, e) => await FetchUnconfirmedCriticalValuesAsync();
-            pollingTimer.AutoReset = true; // Keep polling
-            pollingTimer.Enabled = false; // Start disabled
-        }
+            pollingTimer = new System.Timers.Timer(60000); // 60 seconds interval
+            pollingTimer.Elapsed += async (sender, e) =>
+            {
+                // 确保不重复轮询
+                lock (pollingLock)
+                {
+                    if (isPolling)
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 轮询正在进行中，跳过本次轮询。");
+                        return;
+                    }
+                    isPolling = true;
+                }
 
+                try
+                {
+                    // 根据 Nature 决定轮询数据类型
+                    if (NatureType == "3")
+                    {
+                        Console.WriteLine($"{DateTime.Now}: Nature=3，轮询已处理未查阅危急值数据。");
+                        await FetchProcessedUnviewedCriticalValuesAsync();
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: Nature={NatureType}，轮询未确认危急值数据。");
+                        //await FetchUnconfirmedCriticalValuesAsync();
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"{DateTime.Now}: 轮询过程中发生异常: {ex.Message}");
+                }
+                finally
+                {
+                    lock (pollingLock)
+                    {
+                        isPolling = false;
+                    }
+                    Console.WriteLine($"{DateTime.Now}: 轮询完成，isPolling 已重置为 false");
+                }
+            };
+            pollingTimer.AutoReset = true;
+            pollingTimer.Enabled = false;
+        }
         // 新增一个方法用于处理轮询返回的数据并同步本地列表
         private async void ReconcileAndProcessPolledData(List<CriticalValue> serverUnconfirmedValues)
         {
@@ -2730,20 +3734,98 @@ namespace CriticalValueSystem
 
         }
 
+        // 修改 ReconcileAndProcessPolledData，添加状态同步逻辑
+        //private async void ReconcileAndProcessPolledData(List<CriticalValue> serverUnconfirmedValues)
+        //{
+        //    if (this.InvokeRequired)
+        //    {
+        //        this.BeginInvoke(new Action(() => ReconcileAndProcessPolledData(serverUnconfirmedValues)));
+        //        return;
+        //    }
+        //    bool listChanged = false;
+
+        //    lock (criticalValuesLock)
+        //    {
+        //        // 1. 移除本地已不存在的记录
+        //        var valuesToRemove = criticalValues
+        //            .Where(local => !serverUnconfirmedValues.Any(server => server.criticalId == local.criticalId))
+        //            .ToList();
+        //        foreach (var value in valuesToRemove)
+        //        {
+        //            criticalValues.Remove(value);
+        //            listChanged = true;
+        //            Console.WriteLine($"{DateTime.Now}: Removed stale critical value [{value.criticalId}]");
+        //        }
+
+        //        // 2. 添加或更新记录
+        //        foreach (var serverValue in serverUnconfirmedValues)
+        //        {
+        //            var existingValue = criticalValues.FirstOrDefault(v => v.criticalId == serverValue.criticalId);
+        //            if (existingValue == null)
+        //            {
+        //                // 新记录，添加
+        //                criticalValues.Add(serverValue);
+        //                listChanged = true;
+        //                Console.WriteLine($"{DateTime.Now}: Added new critical value [{serverValue.criticalId}]");
+        //            }
+        //            else
+        //            {
+        //                // 已有记录，更新状态字段
+        //                bool statusChanged = false;
+        //                if (existingValue.confirmStatus != serverValue.confirmStatus ||
+        //                    existingValue.Status != serverValue.Status ||
+        //                    existingValue.IsProcessed != serverValue.IsProcessed)
+        //                {
+        //                    existingValue.confirmStatus = serverValue.confirmStatus;
+        //                    existingValue.Status = serverValue.Status;
+        //                    existingValue.IsProcessed = serverValue.IsProcessed;
+        //                    statusChanged = true;
+        //                    listChanged = true;
+        //                    Console.WriteLine($"{DateTime.Now}: Updated status for critical value [{serverValue.criticalId}]: " +
+        //                        $"ConfirmStatus={serverValue.confirmStatus}, Status={serverValue.Status}, IsProcessed={serverValue.IsProcessed}");
+        //                }
+        //            }
+        //        }
+        //    }
+
+        //    // 3. 如果列表或状态有变化，更新UI
+        //    if (listChanged)
+        //    {
+        //        Console.WriteLine($"{DateTime.Now}: Critical value list or status changed, updating UI.");
+        //        UpdateCriticalValueList();
+        //        UpdateTrayIconText();
+        //        ApplyCurrentButtonVisibilitySetting();
+        //        int latestProcessingCount = await FetchPendingProcessingCountAsync();
+        //        UpdateFormTitle(null, GetUnprocessedCriticalValueCount(), latestProcessingCount >= 0 ? latestProcessingCount : (int?)null);
+
+        //        if (criticalValues.Count > 0)
+        //        {
+        //            StartBlinking();
+        //            ShowAndFocusForm();
+        //        }
+        //        else
+        //        {
+        //            StopBlinking();
+        //            MinimizeFormToTray();
+        //        }
+        //    }
+        //}
+
+
         // New method to fetch unconfirmed data from the server
         // 修改 FetchUnconfirmedCriticalValuesAsync 方法
         private async Task FetchUnconfirmedCriticalValuesAsync()
         {
-            // Prevent concurrent execution
-            lock (pollingLock)
-            {
-                if (isPolling)
-                {
-                    Console.WriteLine($"{DateTime.Now}: Polling already in progress, skipping.");
-                    return;
-                }
-                isPolling = true;
-            }
+            // Prevent concurrent execution  // 不再需要内部的 pollingLock 检查，依赖外部调用者控制并发
+            //lock (pollingLock)
+            //{
+            //    if (isPolling)
+            //    {
+            //        Console.WriteLine($"{DateTime.Now}: Polling already in progress, skipping.");
+            //        return;
+            //    }
+            //    isPolling = true;
+            //}
             string apiUrl;
             try
             {
@@ -2753,25 +3835,27 @@ namespace CriticalValueSystem
                     Console.WriteLine($"{DateTime.Now}: Polling skipped: User not logged in or token invalid/expired.");
                     return;
                 }
-                if (currentUser.Nature.Equals("1"))//医生
+                if (NatureType.Equals("1"))//医生
                 {
 
                     if (ClientType.Equals("1"))
                     {
-                        apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmStatus=待确认&creatorId={currentUser.UserId}"; // 门诊查本人
+                        //apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmStatus=待确认&creatorId={currentUser.UserId}"; // 门诊查本人
+                        apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&status=待处理&creatorId={currentUser.UserId}"; // 门诊查本人
 
                     }
                     else
                     {
-                        apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmStatus=待确认&deptId={currentUser.DeptId}"; // 住院查科室
+                        // apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmStatus=待确认&deptId={currentUser.DeptId}"; // 住院查科室
+                        apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&status=待处理&deptId={currentUser.DeptId}"; // 住院查科室
 
                     }
 
 
                 }
-                else if (currentUser.Nature.Equals("2"))//护士
+                else if (NatureType.Equals("2"))//护士
                 {
-                    apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmStatus=待确认&wardId={currentUser.DeptId}"; // 护士查科室
+                    apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&confirmNurseStatus=待确认&wardId={currentUser.DeptId}"; // 护士查科室
                 }
                 else 
                 {
@@ -2805,8 +3889,11 @@ namespace CriticalValueSystem
                                 deptName = row.DeptName,
                                 triggerTime = row.TriggerTime,
                                 sourceSystem=row.sourceSystem,
-                                Status = row.ConfirmStatus,
+                                Status = row.Status,
+                                confirmStatus = row.ConfirmStatus,
+                                maxTimeoutLevel=row.maxTimeoutLevel,
                                 itemCode = row.ReportId, // Assuming ReportId maps to itemCode for uniqueness/processing logic
+                                wardBeds= row.wardBeds,
                                 IsProcessed = false
                             }).ToList();
 
@@ -2835,14 +3922,217 @@ namespace CriticalValueSystem
                 Console.WriteLine($"{DateTime.Now}: Error during polling: {ex.Message}");
                 // 记录详细错误日志
             }
-            finally
+            //finally
+            //{
+            //    lock (pollingLock)
+            //    {
+            //        isPolling = false; // Release the lock
+            //    }
+            //}
+        }
+
+        //检查危急值是否确认
+        private async Task<bool> CheckCriticalValueConfirmationStatusAsync(string criticalId)
+        {
+            if (string.IsNullOrEmpty(criticalId))
             {
-                lock (pollingLock)
+                Console.WriteLine($"{DateTime.Now}: 无效的 criticalId，无法查询确认状态。");
+                return false;
+            }
+
+            // 确保已登录且有有效 Token
+            if (!isUserLoggedIn || string.IsNullOrEmpty(accessToken))
+            {
+                Console.WriteLine($"{DateTime.Now}: 未登录或 Token 无效，无法查询危急值状态。");
+                return false;
+            }
+
+            string apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&criticalId={criticalId}";
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, apiUrl))
                 {
-                    isPolling = false; // Release the lock
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+                    Console.WriteLine($"{DateTime.Now}: 查询危急值确认状态 [CriticalId={criticalId}]，URL={apiUrl}");
+
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        var apiResponse = JsonConvert.DeserializeObject<CriticalValueApiResponse>(responseBody);
+
+                        if (apiResponse != null && apiResponse.Code == 200 && apiResponse.Rows != null && apiResponse.Rows.Any())
+                        {
+                            var criticalValue = apiResponse.Rows.FirstOrDefault();
+                            if (criticalValue != null)
+                            {
+                                bool isConfirmed = criticalValue.ConfirmStatus == "已确认";
+                                Console.WriteLine($"{DateTime.Now}: 危急值 [CriticalId={criticalId}] 确认状态为: {criticalValue.ConfirmStatus} (IsConfirmed={isConfirmed})");
+                                return isConfirmed;
+                            }
+                            else
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 未找到危急值 [CriticalId={criticalId}] 的记录。");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 查询危急值状态失败 - API 响应无效。Code={apiResponse?.Code}, Msg={apiResponse?.Message}");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 查询危急值状态失败 - HTTP 状态码: {response.StatusCode}");
+                        return false;
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{DateTime.Now}: 查询危急值确认状态时发生异常: {ex.Message}");
+                return false;
+            }
         }
+        private async Task<bool> CheckCriticalValueProcessStatusAsync(string criticalId)
+        {
+            if (string.IsNullOrEmpty(criticalId))
+            {
+                Console.WriteLine($"{DateTime.Now}: 无效的 criticalId，无法查询确认状态。");
+                return false;
+            }
+
+            // 确保已登录且有有效 Token
+            if (!isUserLoggedIn || string.IsNullOrEmpty(accessToken))
+            {
+                Console.WriteLine($"{DateTime.Now}: 未登录或 Token 无效，无法查询危急值状态。");
+                return false;
+            }
+
+            string apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&criticalId={criticalId}";
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, apiUrl))
+                {
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+                    Console.WriteLine($"{DateTime.Now}: 查询危急值处理状态 [CriticalId={criticalId}]，URL={apiUrl}");
+
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        var apiResponse = JsonConvert.DeserializeObject<CriticalValueApiResponse>(responseBody);
+
+                        if (apiResponse != null && apiResponse.Code == 200 && apiResponse.Rows != null && apiResponse.Rows.Any())
+                        {
+                            var criticalValue = apiResponse.Rows.FirstOrDefault();
+                            if (criticalValue != null)
+                            {
+                                bool isProcessed = criticalValue.Status == "已处理";
+                                Console.WriteLine($"{DateTime.Now}: 危急值 [CriticalId={criticalId}] 处理状态为: {criticalValue.Status} (IsProcessed={isProcessed})");
+                                return isProcessed;
+                            }
+                            else
+                            {
+                                Console.WriteLine($"{DateTime.Now}: 未找到危急值 [CriticalId={criticalId}] 的记录。");
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 查询危急值状态失败 - API 响应无效。Code={apiResponse?.Code}, Msg={apiResponse?.Message}");
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 查询危急值状态失败 - HTTP 状态码: {response.StatusCode}");
+                        return false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{DateTime.Now}: 查询危急值处理状态时发生异常: {ex.Message}");
+                return false;
+            }
+        }
+
+        // 新增方法：获取已处理但未查阅的危急值数据
+        private async Task FetchProcessedUnviewedCriticalValuesAsync()
+        {
+            if (!isUserLoggedIn || string.IsNullOrEmpty(accessToken))
+            {
+                Console.WriteLine($"{DateTime.Now}: 获取已处理未查阅危急值失败 - 未登录或Token无效。");
+                return;
+            }
+
+            //string apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=100&status=已处理&viewerStatus=未查阅&executeDeptId={currentUser.DeptId}";
+            //未查阅的数据(肯定包含没处理且超时的) 到时候在界面显示是超时的还是未查阅的作为区分，但是存在一个问题，已处理未查阅的数据无法获取
+            //因此就不显示区分了，点查阅之前先判断是否处理，没处理则给出提示：该危急值超时未处理请通知医生，如果处理完成则调用查阅接口
+            string apiUrl = $"{ApiBaseUrl}/critical/value/list?pageNum=1&pageSize=1000&viewerStatus=未查阅&executeDeptId={currentUser.DeptId}";
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, apiUrl))
+                {
+                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+                    Console.WriteLine($"{DateTime.Now}: 正在轮询已处理未查阅危急值数据...");
+
+                    HttpResponseMessage response = await httpClient.SendAsync(request);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string responseBody = await response.Content.ReadAsStringAsync();
+                        var apiResponse = JsonConvert.DeserializeObject<CriticalValueApiResponse>(responseBody);
+
+                        if (apiResponse != null && apiResponse.Code == 200 && apiResponse.Rows != null)
+                        {
+                            // 将 API 返回的 Rows 转换为 CriticalValue 列表
+                            var fetchedValues = apiResponse.Rows.Select(row => new CriticalValue
+                            {
+                                PatientName = row.PatientName,
+                                Indicator = row.ItemName,
+                                Value = row.CriticalValueString,
+                                patientId = row.PatientId,
+                                criticalId = row.CriticalId,
+                                deptName = row.DeptName,
+                                triggerTime = row.TriggerTime,
+                                sourceSystem = row.sourceSystem,
+                                Status = row.Status,
+                                confirmStatus = row.ConfirmStatus,
+                                maxTimeoutLevel = row.maxTimeoutLevel,
+                                itemCode = row.ReportId, // Assuming ReportId maps to itemCode for uniqueness/processing logic
+                                wardBeds = row.wardBeds,
+                                IsProcessed = row.Status=="已处理"?true:false // 已处理未查阅的数据，标记为已处理
+                            }).ToList();
+
+                            // 调用同步方法处理数据
+                            ReconcileAndProcessPolledData(fetchedValues);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"{DateTime.Now}: 获取已处理未查阅数据请求成功但响应无效。Code: {apiResponse?.Code}, Msg: {apiResponse?.Message}");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{DateTime.Now}: 获取已处理未查阅数据请求失败。状态码: {response.StatusCode}");
+                        if (response.StatusCode == HttpStatusCode.Unauthorized)
+                        {
+                            Console.WriteLine($"{DateTime.Now}: Token可能过期，尝试刷新...");
+                            await GetAccessTokenAsync();
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{DateTime.Now}: 获取已处理未查阅数据时发生异常: {ex.Message}");
+            }
+        }
+
+
 
         // 新增方法：从服务器获取待处理危急值数量
         private async Task<int> FetchPendingProcessingCountAsync()
@@ -3098,7 +4388,7 @@ namespace CriticalValueSystem
                             { "mac", GetMacAddress() },
                             { "userName", currentUser.UserName },
                             { "departmentName", currentUser.DepartmentName },
-                            { "version", currentUser.DepartmentName }
+                            { "version", GetCurrentVersion() }
                         };
 
                 string jsonDataencData = JsonConvert.SerializeObject(JSONencData);
@@ -3244,12 +4534,12 @@ namespace CriticalValueSystem
 
         private async void UpdateTrayIconText()
         {
-            //int unprocessedCount = criticalValues.Count(v => !v.IsProcessed);
-            //trayIcon.Text = $"危急值客户端（未处理：{unprocessedCount}）";
-            // 可选：重新获取待处理数量并更新标题
-            int latestProcessingCount = await FetchPendingProcessingCountAsync();
-            //  UpdateFormTitle(null, GetUnprocessedCriticalValueCount(), latestProcessingCount >= 0 ? latestProcessingCount : (int?)null);
-            trayIcon.Text = $"危急值客户端（未处理：{latestProcessingCount}）";
+            int unprocessedCount = criticalValues.Count(v => !v.IsProcessed);
+            trayIcon.Text = $"危急值客户端（未处理：{unprocessedCount}）";
+            //// 可选：重新获取待处理数量并更新标题
+            //int latestProcessingCount = await FetchPendingProcessingCountAsync();
+            ////  UpdateFormTitle(null, GetUnprocessedCriticalValueCount(), latestProcessingCount >= 0 ? latestProcessingCount : (int?)null);
+            //trayIcon.Text = $"危急值客户端（未处理：{latestProcessingCount}）";
 
         }
         // 更新危急值列表
@@ -3355,18 +4645,78 @@ namespace CriticalValueSystem
                 {
                     triggerTimeInfo = "";
                 }
+                string wardBedsInfo="";
+                //住院增加床号
+                if (!string.IsNullOrEmpty(value.wardBeds))
+                {
+                    wardBedsInfo = value.wardBeds+"床";
+
+                }
+                string confirmStatus = "";
+                //显示处理情况
+
+                if (NatureType.Equals("3"))
+                {
+                    if (!string.IsNullOrEmpty(value.confirmStatus))
+                    {
+                        if (value.maxTimeoutLevel.Equals("1") && value.Status.Equals("待处理"))
+                        {
+                            confirmStatus = "超时未处理";
+                        }
+                        else if (!value.maxTimeoutLevel.Equals("1") && value.Status.Equals("待处理")) {
+                            confirmStatus = "未处理";
+                        }
+                        else if (value.Status.Equals("已处理"))
+                        {
+
+                            confirmStatus = "待查阅";
+
+
+                        }
+
+                    }
+                }
+                //else if(NatureType.Equals("1")) {
+                //    if (!string.IsNullOrEmpty(value.confirmStatus))
+                //    {
+                //        if (value.confirmStatus.Equals("待确认"))
+                //        {
+                //            confirmStatus = "待确认";
+                //        }
+                //        else if (value.confirmStatus.Equals("已确认"))
+                //        {
+                //            if (value.Status.Equals("待处理"))
+                //            {
+
+                //                confirmStatus = "待处理";
+                //            }
+
+                //        }
+
+                //    }
+
+                //}
+
 
                 //string triggerTimeInfo = !string.IsNullOrEmpty(value.triggerTime) ? $" [{value.triggerTime}]" : "";
                 //string itemText = $"{value.PatientName} - {value.Indicator}: {value.Value}{deptInfo}{triggerTimeInfo}"; // 注意 deptInfo 和 triggerTimeInfo 之间的空格或格式
+
+
                 if (value.sourceSystem.Equals("1"))
                 {
-                    string itemText = $"{value.PatientName} - {value.Indicator}: {value.Value}{deptInfo}{triggerTimeInfo}";
+                    //if (!(value.maxTimeoutLevel.Equals("0") && value.Status.Equals("待处理"))) {
+                        string itemText = $"{value.PatientName} {wardBedsInfo} {value.Indicator}: {value.Value}{deptInfo}{triggerTimeInfo}{confirmStatus}";
+                        lstCriticalValues.Items.Add(itemText);
+                   // }
+
+                }
+                else
+                {
+                    string itemText = $"{value.PatientName} {wardBedsInfo} {value.Indicator}: {deptInfo}{triggerTimeInfo}{confirmStatus}";
                     lstCriticalValues.Items.Add(itemText);
                 }
-                else {
-                    string itemText = $"{value.PatientName} - {value.Indicator}: {deptInfo}{triggerTimeInfo}";
-                    lstCriticalValues.Items.Add(itemText);
-                }
+
+
 
             }
 
@@ -3512,6 +4862,15 @@ namespace CriticalValueSystem
             // 确保索引有效且在显示的列表中
             if (index < 0 || index >= displayedCriticalValues.Count)
                 return;
+
+            // 获取 Nature
+            string nature = NatureType ?? "1";
+
+            //if (nature == "2")
+            //{
+            //    // Nature == "2"：不响应双击
+            //    return;
+            //}
 
             // **** 修改点：从 displayedCriticalValues 中获取对象 ****
             CriticalValue value = null;
@@ -3759,7 +5118,7 @@ namespace CriticalValueSystem
         /// <param name="strJsonIn">{"LoginUser":"字符串|登录用户","Scene":"数字|场景序号"}</param>
         /// <param name="strJsonOut">{"Result":"数字|检查结果:1-通过,0-不通过"}</param>
         /// <returns></returns>
-        public bool APP_CheckCertificate(string strJsonIn, out string strJsonOut)
+        public bool APP_CheckCertificate(string strJsonIn, out string strJsonOut, out string strJsonName)
         {
             string strInfo;
             JObject objJson;
@@ -3772,6 +5131,7 @@ namespace CriticalValueSystem
             ClsPublic.WriteLog("校验是否本人操作", 3);
             //strJsonOut = "{\"Result\":\"0\"}";
             strJsonOut = "";
+            strJsonName = "";
             try
             {
                 objJson = JObject.Parse(strJsonIn);
@@ -3799,7 +5159,8 @@ namespace CriticalValueSystem
                 }
 
 
-                 strJsonOut = (CertCN?.StartsWith("U",StringComparison.OrdinalIgnoreCase) ?? false) ? CertCN : "U" + CertCN;
+                 strJsonOut = (CertCN?.StartsWith("U",StringComparison.OrdinalIgnoreCase) ?? false) ? CertCN : "U" + CertCN;//用户登录id
+                 strJsonName = CertDN;//用户姓名
                 //if (strInfo == "1")
                 //    {
                 //        ClsPublic.gdtExemptTime = DateTime.Now;
@@ -3887,7 +5248,7 @@ namespace CriticalValueSystem
         public string PatientName { get; set; }//姓名
         public string Indicator { get; set; }//检验项目名称
         public string Value { get; set; }//结果
-        public string Status { get; set; }//状态
+        public string Status { get; set; }//状态 处理状态(待处理、未处理)
         public string patientId { get; set; }//病人id
         public string itemCode { get; set; }//检验项目编码
 
@@ -3900,7 +5261,14 @@ namespace CriticalValueSystem
         public string triggerTime { get; set; } // 危急值触发时间
 
 
-        public string sourceSystem { get; set; } // 危急值触发时间
+        public string sourceSystem { get; set; } // 危急值来源
+
+        public string wardBeds { get; set; } // 住院床号
+
+        public string confirmStatus { get; set; } // 确认状态(已确认、待确认)
+
+        public string maxTimeoutLevel { get; set; } //是否超时
+                                                  // 
         //public override bool Equals(object obj)
         //{
         //    if (obj is CriticalValue other)
@@ -4018,6 +5386,17 @@ namespace CriticalValueSystem
         [JsonProperty("timeoutCount")]
         public int TimeoutCount { get; set; } // 新增：超时计数
         // ... add other fields from the API response if required ...
+        [JsonProperty("status")]
+        public string Status { get; set; } // 新增：状态字段（如“已处理”）
+        [JsonProperty("viewerStatus")]
+        public string ViewerStatus { get; set; } // 新增：查阅状态字段（如“未查阅”）
+
+        [JsonProperty("wardBeds")]
+        public string wardBeds { get; set; } // 住院床号
+
+        [JsonProperty("maxTimeoutLevel")]
+        public string maxTimeoutLevel { get; set; } //是否超时
+
     }
     // 用于解析配置API响应的模型
     public class ConfigResponse

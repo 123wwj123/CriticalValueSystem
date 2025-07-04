@@ -85,7 +85,7 @@ namespace ZL_BJCAAllinterface
                                 objJson["data"]["msspId"].Value<string>() + "|" + objJson["data"]["status"].Value<string>() + "|" + objJson["data"]["createTime"].Value<string>();
                     ClsPublic.WriteLog("拼接的CA证书签章信息：" + EncCert, 4);
                     CertCN = EncCert.Split('|')[8];
-                    CertDN = EncCert.Split('|')[11];
+                    CertDN = EncCert.Split('|')[1];
                     CertSN = EncCert.Split('|')[11];
                     blnResult = true;
                 }
